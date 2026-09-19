@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+build-release/
+dist/
+preview/
+assets/pysnip-build.png
+PySnip.ini
+*.session.json
+*.log
+.env
+.env.*
