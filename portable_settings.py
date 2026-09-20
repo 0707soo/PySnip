@@ -41,5 +41,6 @@ def open_settings(path=None, legacy=None):
         settings.setValue('OCR/retry_scale', 2)
         settings.setValue('OCR/auto_copy', False)
         settings.setValue('Session/restore_pins', False)
+        settings.setValue('History/limit', 0)
         settings.sync()
     return settings

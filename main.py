@@ -43,6 +43,7 @@ class CaptureOverlay(QWidget):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.screenshot = screenshot
         self.origin = None
+        self.pointer = None
         self.selection = QRect()
         self.setGeometry(screen.geometry())
         self.setCursor(Qt.CursorShape.CrossCursor)
@@ -62,6 +63,9 @@ class CaptureOverlay(QWidget):
             painter.drawRect(self.selection.adjusted(0, 0, -1, -1))
         painter.setPen(Qt.GlobalColor.white)
         painter.drawText(24, 32, '드래그: 영역 선택 후 고정  ·  Esc / 우클릭: 취소')
+        if self.pointer is not None:
+            from magnifier import draw_magnifier
+            draw_magnifier(painter, self.screenshot, self.pointer, self.rect(), self.selection)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.RightButton:
@@ -69,10 +73,15 @@ class CaptureOverlay(QWidget):
         elif event.button() == Qt.MouseButton.LeftButton:
             self.origin = event.position().toPoint()
 
+    def leaveEvent(self, event):
+        self.pointer = None
+        self.update()
+
     def mouseMoveEvent(self, event):
+        self.pointer = event.position().toPoint()
         if self.origin is not None:
             self.selection = drag_rect(self.origin, event.position().toPoint(), self.rect())
-            self.update()
+        self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton or self.origin is None:
@@ -95,11 +104,13 @@ class PinWindow(QWidget):
     ocr_requested = Signal(QPixmap)
     settings_requested = Signal()
     opacity_requested = Signal(int)
+    edit_requested = Signal(object)
 
     def __init__(self, pixmap, position):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.pixmap = pixmap
         self.scale = 1.0
+        self.locked = False
         self.border_width = 1
         self.opacity_percent = 100
         self.drag_offset = None
@@ -108,7 +119,7 @@ class PinWindow(QWidget):
         self.setMinimumSize(1, 1)
         self.move(position)
         self.resize_image()
-        for sequence, callback in [('Ctrl+C', self.copy_image), ('Ctrl+S', self.save_image), ('Ctrl+T', self.extract_text), ('Escape', self.close), ('0', self.reset_size)]:
+        for sequence, callback in [('Ctrl+C', self.copy_image), ('Ctrl+S', self.save_image), ('Ctrl+T', self.extract_text), ('Escape', self.close), ('0', self.reset_size), ('Ctrl+L', self.toggle_lock), ('Ctrl+E', lambda: self.edit_requested.emit(self))]:
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.activated.connect(callback)
 
@@ -135,17 +146,19 @@ class PinWindow(QWidget):
         painter.drawPixmap(self.rect().adjusted(border, border, -border, -border), self.pixmap)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if not self.locked and event.button() == Qt.MouseButton.LeftButton:
             self.drag_offset = event.globalPosition().toPoint() - self.pos()
 
     def mouseMoveEvent(self, event):
-        if self.drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+        if not self.locked and self.drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self.drag_offset)
 
     def mouseReleaseEvent(self, event):
         self.drag_offset = None
 
     def wheelEvent(self, event):
+        if self.locked:
+            return
         delta = event.angleDelta().y()
         if not delta:
             return
@@ -155,7 +168,14 @@ class PinWindow(QWidget):
             self.scale = min(5.0, max(0.1, self.scale * (1.1 if delta > 0 else 1 / 1.1)))
             self.resize_image()
 
+    def toggle_lock(self):
+        self.locked = not self.locked
+        self.drag_offset = None
+        self.setWindowTitle('PySnip — 고정 이미지' + (' (잠금)' if self.locked else ''))
+
     def reset_size(self):
+        if self.locked:
+            return
         self.scale = 1.0
         self.resize_image()
 
@@ -175,6 +195,11 @@ class PinWindow(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        lock = menu.addAction('이동·크기 잠금 (Ctrl+L)', self.toggle_lock)
+        lock.setCheckable(True)
+        lock.setChecked(self.locked)
+        menu.addAction('이미지 편집 (Ctrl+E)', lambda: self.edit_requested.emit(self))
+        menu.addSeparator()
         for label, callback in [('복사 (Ctrl+C)', self.copy_image), ('저장 (Ctrl+S)', self.save_image), ('텍스트 추출 OCR (Ctrl+T)', self.extract_text), ('설정', self.settings_requested.emit), ('원래 크기 (0)', self.reset_size), ('닫기 (Esc)', self.close)]:
             menu.addAction(label, callback)
         menu.exec(event.globalPos())
@@ -213,6 +238,13 @@ class MainWindow(QMainWindow):
         self.restore_pins = str(self.settings.value('Session/restore_pins', False)).lower() in ('true', '1')
         self.session_path = Path(self.settings.fileName()).with_suffix('.session.json')
         self.ocr_auto_copy = str(self.settings.value('OCR/auto_copy', False)).lower() in ('true', '1')
+        try:
+            self.history_limit = min(999999, max(0, int(self.settings.value('History/limit', 0))))
+        except (ValueError, TypeError):
+            self.history_limit = 0
+        self.closed_pins = []
+        self.editors = []
+        self.history_action = None
         self.settings_dialog = None
         self.ocr_dialogs = []
         self.hotkey_error = ''
@@ -250,6 +282,11 @@ class MainWindow(QMainWindow):
         self.toggle_button.setMinimumHeight(34)
         self.toggle_button.clicked.connect(self.toggle_pins)
         layout.insertWidget(4, self.toggle_button)
+        self.history_button = QPushButton('마지막 닫은 이미지 복원')
+        self.history_button.setMinimumHeight(34)
+        self.history_button.clicked.connect(self.restore_closed_pin)
+        layout.insertWidget(5, self.history_button)
+        self.refresh_history()
         self.status = QLabel('고정 창: 드래그 이동 / 휠 확대·축소\nCtrl+휠 투명도 / 우클릭 메뉴')
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
@@ -269,6 +306,8 @@ class MainWindow(QMainWindow):
                 menu = QMenu(self)
                 self.tray_actions = [menu.addAction('영역 캡처', self.capture), menu.addAction('클립보드 고정', self.pin_clipboard)]
                 self.toggle_action = menu.addAction('고정 이미지 숨김·복원', self.toggle_pins)
+                self.history_action = menu.addAction('마지막 닫은 이미지 복원', self.restore_closed_pin)
+                self.refresh_history()
                 menu.addAction('설정', self.open_settings)
                 menu.addAction('메인 창 열기', self.show_main)
                 menu.addSeparator()
@@ -302,9 +341,11 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self.status.setText(f'고정 이미지 복원 실패: {exc}')
             return
-        for pixmap, x, y, scale in records:
+        for pixmap, x, y, scale, locked in records:
             pin = self.add_pin(pixmap, QPoint(x, y))
             pin.scale = scale
+            if locked:
+                pin.toggle_lock()
             pin.resize_image()
             # A removed monitor must not leave restored images inaccessible.
             if not any(screen.availableGeometry().contains(pin.pos()) for screen in QApplication.screens()):
@@ -348,7 +389,7 @@ class MainWindow(QMainWindow):
     def apply_bindings(self, bindings):
         self.apply_settings(bindings, self.opacity_percent, self.border_width)
 
-    def apply_settings(self, bindings, opacity, border, ocr_language=None, ocr_scale=None, ocr_auto_copy=None, restore_pins=None):
+    def apply_settings(self, bindings, opacity, border, ocr_language=None, ocr_scale=None, ocr_auto_copy=None, restore_pins=None, history_limit=None):
         bindings = {**self.bindings, **bindings}
         validate_bindings(bindings)
         if self.hotkeys:
@@ -366,6 +407,10 @@ class MainWindow(QMainWindow):
         if restore_pins is not None:
             self.restore_pins = bool(restore_pins)
         self.settings.setValue('Session/restore_pins', self.restore_pins)
+        if history_limit is not None:
+            self.history_limit = min(999999, max(0, int(history_limit)))
+        self.settings.setValue('History/limit', self.history_limit)
+        self.trim_history()
         if not self.restore_pins:
             self.session_path.unlink(missing_ok=True)
         self.hotkey_error = ''
@@ -484,6 +529,7 @@ class MainWindow(QMainWindow):
         pin.set_border_width(self.border_width)
         self.pins.append(pin)
         pin.closed.connect(self.remove_pin)
+        pin.edit_requested.connect(self.open_editor)
         pin.ocr_requested.connect(self.open_ocr)
         pin.settings_requested.connect(self.open_settings)
         pin.opacity_requested.connect(self.set_global_opacity)
@@ -495,10 +541,57 @@ class MainWindow(QMainWindow):
 
     def remove_pin(self, pin):
         if pin in self.pins:
+            if not self.quitting:
+                self.closed_pins.append((QPixmap(pin.pixmap), QPoint(pin.pos()), pin.scale, pin.locked))
+                self.trim_history()
             self.pins.remove(pin)
         if not self.pins:
             self.pins_hidden = False
         self.refresh_toggle_label()
+
+    def refresh_history(self):
+        text = f'마지막 닫은 이미지 복원 ({len(self.closed_pins)})'
+        self.history_button.setText(text)
+        self.history_button.setEnabled(bool(self.closed_pins))
+        if self.history_action:
+            self.history_action.setText(text)
+            self.history_action.setEnabled(bool(self.closed_pins))
+
+    def trim_history(self):
+        if self.history_limit:
+            self.closed_pins = self.closed_pins[-self.history_limit:]
+        self.refresh_history()
+
+    def restore_closed_pin(self):
+        if self.quitting or self.capturing or not self.closed_pins:
+            return
+        pixmap, position, scale, locked = self.closed_pins.pop()
+        if self.pins_hidden:
+            self.toggle_pins()
+        pin = self.add_pin(pixmap, position)
+        pin.scale = scale
+        if locked:
+            pin.toggle_lock()
+        pin.resize_image()
+        if not any(screen.availableGeometry().contains(pin.pos()) for screen in QApplication.screens()):
+            pin.move(QApplication.primaryScreen().availableGeometry().topLeft() + QPoint(30, 30))
+        self.refresh_history()
+
+    def open_editor(self, pin):
+        if self.quitting or self.capturing:
+            return
+        from annotation_ui import AnnotationDialog
+        dialog = AnnotationDialog(pin.pixmap, self)
+        self.editors.append(dialog)
+        position = QPoint(pin.pos()) + QPoint(24, 24)
+        dialog.pin_requested.connect(lambda pixmap: self.add_edited_pin(pixmap, position))
+        dialog.finished.connect(lambda _result: self.editors.remove(dialog) if dialog in self.editors else None)
+        dialog.show()
+
+    def add_edited_pin(self, pixmap, position):
+        if self.pins_hidden:
+            self.toggle_pins()
+        self.add_pin(pixmap, position)
 
     def pin_clipboard(self):
         if self.capturing or self.quitting or self.settings_dialog is not None:
@@ -550,6 +643,9 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.warning(self, '고정 이미지 저장 실패', f'다음 실행을 위한 이미지를 저장하지 못했습니다.\n{exc}')
         self.capture_timer.stop()
+        self.closed_pins.clear()
+        for editor in list(self.editors):
+            editor.close()
         if self.settings_dialog is not None:
             self.settings_dialog.reject()
         for dialog in list(self.ocr_dialogs):

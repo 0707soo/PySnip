@@ -105,7 +105,7 @@ class HotkeyTests(unittest.TestCase):
         manager = WindowsHotkeys({}, api)
         manager.apply(DEFAULTS)
         before = dict(api.registered)
-        for sequence in ['Win+D', 'Win+Ctrl+A', 'Alt+F4', 'Ctrl+C', 'Ctrl+S', 'Ctrl+T']:
+        for sequence in ['Win+D', 'Win+Ctrl+A', 'Alt+F4', 'Ctrl+C', 'Ctrl+S', 'Ctrl+T', 'Ctrl+E', 'Ctrl+L']:
             with self.subTest(sequence=sequence), self.assertRaises(ValueError):
                 manager.apply({'capture': sequence, 'clipboard': 'F3'})
             self.assertEqual(api.registered, before)
@@ -199,4 +199,3 @@ class HotkeyTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

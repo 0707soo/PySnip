@@ -9,7 +9,9 @@ import unittest
 class ShutdownTests(unittest.TestCase):
     def test_exit_button_with_multiple_pins_and_tray(self):
         script = '''
-from PySide6.QtCore import QPoint, QTimer
+import tempfile
+from pathlib import Path
+from PySide6.QtCore import QPoint, QTimer, QSettings
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication, QPushButton
 from main import MainWindow
@@ -21,13 +23,15 @@ class Tray:
 
 app = QApplication([])
 app.setQuitOnLastWindowClosed(False)
-window = MainWindow(enable_integrations=False)
+directory = tempfile.TemporaryDirectory()
+window = MainWindow(enable_integrations=False, settings=QSettings(str(Path(directory.name) / 'test.ini'), QSettings.IniFormat))
 window.tray = Tray()
 window.show()
 image = QPixmap(40, 40)
 image.fill()
 for i in range(3):
     window.add_pin(image, QPoint(i * 50, 0))
+window.open_editor(window.pins[0])
 button = next(b for b in window.findChildren(QPushButton) if b.text() == '종료')
 QTimer.singleShot(0, button.click)
 # A quit rejected by closeEvent must fail, rather than hang the test runner.
@@ -35,6 +39,7 @@ QTimer.singleShot(1000, lambda: app.exit(42))
 result = app.exec()
 assert result == 0, f'Exit was rejected: {result}'
 assert not window.pins, 'Pin windows were not cleaned up'
+assert not window.editors, 'Editors were not cleaned up'
 assert not window.tray.isVisible(), 'Tray icon still visible'
 '''
         result = subprocess.run(

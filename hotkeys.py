@@ -42,8 +42,8 @@ def validate_bindings(bindings, check_reserved=True):
                 reason = 'Win 키 조합은 Windows 예약 단축키이므로 사용할 수 없습니다.'
             elif modifiers == MODIFIERS['Alt'] and key == KEYS['F4']:
                 reason = 'Alt+F4는 창 닫기 단축키이므로 사용할 수 없습니다.'
-            elif modifiers == MODIFIERS['Ctrl'] and key in (KEYS['C'], KEYS['S'], KEYS['T']):
-                reason = 'Ctrl+C/S/T는 앱의 복사·저장·OCR 기능에서 사용하는 단축키입니다.'
+            elif modifiers == MODIFIERS['Ctrl'] and key in (KEYS['C'], KEYS['S'], KEYS['T'], KEYS['E'], KEYS['L']):
+                reason = 'Ctrl+C/S/T/E/L은 앱의 복사·저장·OCR·편집·잠금 기능에서 사용하는 단축키입니다.'
             if reason:
                 raise ValueError(f'{LABELS[name]}: {reason}')
     if len(set(specs)) != len(specs):
@@ -227,6 +227,14 @@ class SettingsDialog(QDialog):
         self.restore_pins.setChecked(parent.restore_pins)
         self.restore_pins.setToolTip('종료 시 이미지와 위치·확대율을 앱 폴더에 저장합니다.')
         layout.addWidget(self.restore_pins)
+        history_form = QFormLayout()
+        self.history_limit = QSpinBox()
+        self.history_limit.setRange(0, 999999)
+        self.history_limit.setSpecialValueText('0 (무제한)')
+        self.history_limit.setValue(parent.history_limit)
+        history_form.addRow('닫은 이미지 보관 개수', self.history_limit)
+        history_form.addRow(QLabel('최근에 닫은 이미지부터 복원합니다. 보관 기록은 종료 시 비워집니다.'))
+        layout.addLayout(history_form)
         reset = QPushButton('전체 기본값 복원')
         reset.clicked.connect(self.reset_defaults)
         layout.addWidget(reset)
@@ -266,10 +274,11 @@ class SettingsDialog(QDialog):
         self.ocr_scale.button(2).setChecked(True)
         self.ocr_auto_copy.setChecked(False)
         self.restore_pins.setChecked(False)
+        self.history_limit.setValue(0)
 
     def save(self):
         try:
-            self.parent().apply_settings({name: editor.value() for name, editor in self.editors.items()}, self.opacity.value(), self.border.value(), self.ocr_language.currentData(), self.ocr_scale.checkedId(), self.ocr_auto_copy.isChecked(), self.restore_pins.isChecked())
+            self.parent().apply_settings({name: editor.value() for name, editor in self.editors.items()}, self.opacity.value(), self.border.value(), self.ocr_language.currentData(), self.ocr_scale.checkedId(), self.ocr_auto_copy.isChecked(), self.restore_pins.isChecked(), self.history_limit.value())
         except (ValueError, OSError) as exc:
             QMessageBox.warning(self, '설정', str(exc))
             return
