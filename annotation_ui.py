@@ -1,8 +1,9 @@
 """Non-destructive annotation editor; exported images contain flattened edits."""
 import math
+from copy import deepcopy
 from dataclasses import dataclass, field
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainterPath, QPainterPathStroker, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut
 from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog, QFileDialog,
     QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
@@ -22,7 +23,47 @@ class Mark:
 
 
 TOOLS = [('펜', 'pen'), ('형광펜', 'marker'), ('사각형', 'rectangle'),
-         ('타원', 'ellipse'), ('화살표', 'arrow'), ('텍스트', 'text'), ('모자이크', 'mosaic')]
+         ('타원', 'ellipse'), ('화살표', 'arrow'), ('텍스트', 'text'), ('모자이크', 'mosaic'), ('선택·이동', 'select')]
+
+MOVABLE = {'rectangle', 'ellipse', 'arrow', 'text'}
+
+
+def arrow_head(mark):
+    angle = math.atan2(mark.end.y() - mark.start.y(), mark.end.x() - mark.start.x())
+    length = min(math.hypot(mark.end.x() - mark.start.x(), mark.end.y() - mark.start.y()) / 2,
+                 max(12, mark.width * 4))
+    return QPolygonF([mark.end] + [mark.end - QPointF(length * math.cos(angle + offset),
+                        length * math.sin(angle + offset)) for offset in (-0.5, 0.5)])
+
+
+def text_bounds(mark):
+    font = QFont('Malgun Gothic')
+    font.setPixelSize(mark.font_size)
+    bounds = QFontMetricsF(font).boundingRect(QRectF(0, 0, 100000, 100000),
+                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, mark.text)
+    return QRectF(mark.start.x(), mark.start.y(), max(1, bounds.width()), max(1, bounds.height()))
+
+
+def mark_path(mark):
+    path = QPainterPath()
+    rect = QRectF(mark.start, mark.end).normalized()
+    if mark.tool == 'rectangle':
+        path.addRect(rect)
+    elif mark.tool == 'ellipse':
+        path.addEllipse(rect)
+    elif mark.tool == 'arrow':
+        path.moveTo(mark.start)
+        path.lineTo(mark.end)
+        path.addPolygon(arrow_head(mark))
+    elif mark.tool == 'text':
+        path.addRect(text_bounds(mark))
+    return path
+
+
+def mark_bounds(mark):
+    bounds = mark_path(mark).boundingRect()
+    pad = 0 if mark.tool == 'text' else mark.width / 2
+    return bounds.adjusted(-pad, -pad, pad, pad)
 
 
 def draw_marker(painter, mark, bounds):
@@ -87,13 +128,8 @@ def render_marks(original, marks):
             painter.drawEllipse(rect)
         elif mark.tool == 'arrow':
             painter.drawLine(mark.start, mark.end)
-            angle = math.atan2(mark.end.y() - mark.start.y(), mark.end.x() - mark.start.x())
-            length = min(math.hypot(rect.width(), rect.height()) / 2, max(12, mark.width * 4))
-            points = [mark.end]
-            for offset in (-0.5, 0.5):
-                points.append(mark.end - QPointF(length * math.cos(angle + offset), length * math.sin(angle + offset)))
             painter.setBrush(QColor(mark.color))
-            painter.drawPolygon(QPolygonF(points))
+            painter.drawPolygon(arrow_head(mark))
         elif mark.tool == 'text':
             font = QFont('Malgun Gothic')
             font.setPixelSize(mark.font_size)
@@ -117,6 +153,10 @@ class AnnotationCanvas(QWidget):
         self.original.setDevicePixelRatio(1)
         self.marks = []
         self.redo_marks = []
+        self.undo_states = []
+        self.selected_index = None
+        self.move_before = None
+        self.move_origin = None
         self.rendered = self.original.copy()
         self.tool = 'rectangle'
         self.color = '#ef4444'
@@ -163,21 +203,29 @@ class AnnotationCanvas(QWidget):
         return Mark(self.tool, start, end, self.active_color(), width, text, self.font_size, self.block, opacity=self.marker_opacity)
 
     def commit(self, mark):
+        self.undo_states.append(deepcopy(self.marks))
         self.marks.append(mark)
+        self.selected_index = len(self.marks) - 1 if mark.tool in MOVABLE else None
         self.redo_marks.clear()
         self.rendered = render_marks(self.rendered, [mark])
         self.changed.emit()
         self.update()
 
     def cancel_stroke(self):
+        if self.move_before is not None:
+            self.marks = self.move_before
+            self.move_before = self.move_origin = None
+            self.rendered = render_marks(self.original, self.marks)
         self.start_point = self.end_point = None
         self.stroke_points = []
         self.update()
 
     def undo(self):
         self.cancel_stroke()
-        if self.marks:
-            self.redo_marks.append(self.marks.pop())
+        if self.undo_states:
+            self.redo_marks.append(deepcopy(self.marks))
+            self.marks = self.undo_states.pop()
+            self.selected_index = None
             self.rendered = render_marks(self.original, self.marks)
             self.changed.emit()
             self.update()
@@ -185,11 +233,45 @@ class AnnotationCanvas(QWidget):
     def redo(self):
         self.cancel_stroke()
         if self.redo_marks:
-            mark = self.redo_marks.pop()
-            self.marks.append(mark)
-            self.rendered = render_marks(self.rendered, [mark])
+            self.undo_states.append(deepcopy(self.marks))
+            self.marks = self.redo_marks.pop()
+            self.selected_index = None
+            self.rendered = render_marks(self.original, self.marks)
             self.changed.emit()
             self.update()
+
+    def hit_test(self, point):
+        if self.tool not in MOVABLE and self.tool != 'select':
+            return None
+        tolerance = 5 * self.original.width() / max(1, self.image_rect().width())
+        for index in range(len(self.marks) - 1, -1, -1):
+            mark = self.marks[index]
+            if mark.tool not in MOVABLE:
+                continue
+            path = mark_path(mark)
+            stroke = QPainterPathStroker()
+            stroke.setWidth(mark.width + tolerance * 2)
+            interior = (self.tool == 'select' or index == self.selected_index or mark.tool == 'text')
+            if stroke.createStroke(path).contains(point) or (interior and path.contains(point)):
+                return index
+        return None
+
+    def move_selection(self, point):
+        if self.move_before is None:
+            return
+        before = self.move_before[self.selected_index]
+        bounds = mark_bounds(before)
+        delta = point - self.move_origin
+        def clamp(value, low, high):
+            return min(max(value, low), high) if low <= high else 0
+        dx = clamp(delta.x(), min(0, -bounds.left()), max(0, self.original.width() - bounds.right()))
+        dy = clamp(delta.y(), min(0, -bounds.top()), max(0, self.original.height() - bounds.bottom()))
+        moved = deepcopy(before)
+        moved.start += QPointF(dx, dy)
+        moved.end += QPointF(dx, dy)
+        self.marks[self.selected_index] = moved
+        self.rendered = render_marks(self.original, self.marks)
+        self.update()
 
     def result(self):
         pixmap = QPixmap.fromImage(self.rendered)
@@ -202,6 +284,16 @@ class AnnotationCanvas(QWidget):
         rect = self.image_rect()
         painter.fillRect(rect, Qt.GlobalColor.white)
         painter.drawImage(rect, self.rendered)
+        if self.selected_index is not None:
+            bounds = mark_bounds(self.marks[self.selected_index])
+            sx, sy = rect.width() / self.original.width(), rect.height() / self.original.height()
+            selected = QRectF(rect.x() + bounds.x() * sx, rect.y() + bounds.y() * sy,
+                              bounds.width() * sx, bounds.height() * sy)
+            painter.save()
+            painter.setClipRect(rect)
+            painter.setPen(QPen(QColor('#38bdf8'), 1, Qt.PenStyle.DashLine))
+            painter.drawRect(selected.adjusted(-3, -3, 3, 3))
+            painter.restore()
         if self.start_point is not None and self.end_point is not None:
             # Preview in image coordinates without re-rendering the full-size bitmap.
             painter.save()
@@ -236,6 +328,18 @@ class AnnotationCanvas(QWidget):
         point = self.image_point(event.position())
         if point is None:
             return
+        hit = None if event.modifiers() & Qt.KeyboardModifier.ControlModifier else self.hit_test(point)
+        if hit is not None:
+            self.selected_index = hit
+            self.move_origin = point
+            self.move_before = deepcopy(self.marks)
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+            self.update()
+            return
+        self.selected_index = None
+        if self.tool == 'select':
+            self.update()
+            return
         if self.tool == 'text':
             text, accepted = QInputDialog.getMultiLineText(self, '텍스트 추가', '이미지에 표시할 내용:')
             if accepted and text.strip():
@@ -246,6 +350,12 @@ class AnnotationCanvas(QWidget):
         self.update()
 
     def mouseMoveEvent(self, event):
+        point = self.image_point(event.position(), clamp=True)
+        if self.move_before is not None:
+            self.move_selection(point)
+            return
+        self.setCursor(Qt.CursorShape.SizeAllCursor if self.hit_test(point) is not None
+                       else Qt.CursorShape.CrossCursor)
         if self.start_point is not None:
             self.end_point = self.image_point(event.position(), clamp=True)
             if self.tool in ('pen', 'marker'):
@@ -253,6 +363,16 @@ class AnnotationCanvas(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.move_before is not None:
+            self.move_selection(self.image_point(event.position(), clamp=True))
+            before = self.move_before
+            self.move_before = self.move_origin = None
+            if self.marks != before:
+                self.undo_states.append(before)
+                self.redo_marks.clear()
+                self.changed.emit()
+            self.update()
+            return
         if event.button() != Qt.MouseButton.LeftButton or self.start_point is None:
             return
         end = self.image_point(event.position(), clamp=True)
@@ -289,36 +409,19 @@ class AnnotationDialog(QDialog):
         self.canvas = AnnotationCanvas(pixmap)
         self.canvas.tool = self.tool.currentData()
         self.tool.currentIndexChanged.connect(self.change_tool)
-        color = QPushButton('색상')
-        color.clicked.connect(self.choose_color)
-        toolbar.addWidget(color)
-        self.option_widgets = {}
-        for label, low, high, default, attribute in [('선', 1, 30, 3, 'width_px'),
-                ('글자', 8, 200, 24, 'font_size'), ('모자이크', 4, 100, 12, 'block')]:
-            option_label = QLabel(label)
-            toolbar.addWidget(option_label)
-            spin = QSpinBox()
-            spin.setRange(low, high)
-            spin.setValue(default)
-            spin.setSuffix(' px')
-            spin.valueChanged.connect(lambda value, name=attribute: setattr(self.canvas, name, value))
-            toolbar.addWidget(spin)
-            self.option_widgets[attribute] = (option_label, spin)
+        self.tool.setFixedWidth(120)
+        self.color_button = QPushButton('색상')
+        self.color_button.setFixedWidth(100)
+        self.color_button.clicked.connect(self.choose_color)
+        toolbar.addWidget(self.color_button)
+        from annotation_controls import CanvasOptions
+        self.options = CanvasOptions(self.canvas)
+        self.option_widgets = self.options.widgets
+        toolbar.addWidget(self.options)
+        toolbar.addStretch(1)
         layout.addLayout(toolbar)
-        marker_row = QHBoxLayout()
-        for label, low, high, default, attribute, suffix in [('형광펜 두께', 4, 100, 20, 'marker_width', ' px'), ('형광펜 진하기', 10, 80, 40, 'marker_opacity', ' %')]:
-            option_label = QLabel(label)
-            spin = QSpinBox()
-            spin.setRange(low, high)
-            spin.setValue(default)
-            spin.setSuffix(suffix)
-            spin.valueChanged.connect(lambda value, name=attribute: setattr(self.canvas, name, value))
-            marker_row.addWidget(option_label)
-            marker_row.addWidget(spin)
-            self.option_widgets[attribute] = (option_label, spin)
-        layout.addLayout(marker_row)
         layout.addWidget(self.canvas, 1)
-        self.notice = QLabel('드래그하여 그리기 · 텍스트는 클릭하여 입력 · 우클릭으로 그리기 취소')
+        self.notice = QLabel('선택·이동: 도형·텍스트 드래그 · Ctrl+드래그: 겹쳐 그리기 · 우클릭: 작업 취소')
         layout.addWidget(self.notice)
         actions = QHBoxLayout()
         self.undo_button = QPushButton('실행 취소 (Ctrl+Z)')
@@ -344,17 +447,17 @@ class AnnotationDialog(QDialog):
 
     def change_tool(self):
         self.canvas.cancel_stroke()
+        self.canvas.selected_index = None
+        self.canvas.update()
         self.canvas.tool = self.tool.currentData()
         self.update_options()
 
     def update_options(self):
-        active = {'pen': ['width_px'], 'rectangle': ['width_px'], 'ellipse': ['width_px'], 'arrow': ['width_px'], 'text': ['font_size'], 'mosaic': ['block'], 'marker': ['marker_width', 'marker_opacity']}
-        for attribute, widgets in self.option_widgets.items():
-            for widget in widgets:
-                widget.setEnabled(attribute in active[self.canvas.tool])
+        self.options.update_tool()
+        self.color_button.setVisible(self.canvas.tool not in ('mosaic', 'select'))
 
     def update_actions(self):
-        self.undo_button.setEnabled(bool(self.canvas.marks))
+        self.undo_button.setEnabled(bool(self.canvas.undo_states))
         self.redo_button.setEnabled(bool(self.canvas.redo_marks))
 
     def choose_color(self):
