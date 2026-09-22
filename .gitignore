@@ -12,3 +12,5 @@ PySnip.ini
 *.log
 .env
 .env.*
+PySnip.spec
+assets/pysnip.ico

@@ -5,6 +5,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from PySide6.QtWidgets import QMessageBox
 import uuid
 from unittest.mock import patch
 from PySide6.QtCore import QPoint, QSettings
@@ -17,6 +19,12 @@ from single_instance import SingleInstance
 
 
 class NewFeatureTests(unittest.TestCase):
+    def setUp(self):
+        for method in ('exec', 'question'):
+            mock = patch('main.QMessageBox.' + method, return_value=QMessageBox.StandardButton.Yes)
+            mock.start()
+            self.addCleanup(mock.stop)
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

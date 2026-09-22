@@ -1,6 +1,6 @@
 """Non-destructive annotation editor; exported images contain flattened edits."""
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from PySide6.QtCore import QPointF, QRect, QRectF, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPen, QPixmap, QPolygonF, QShortcut
 from PySide6.QtWidgets import (QApplication, QColorDialog, QComboBox, QDialog, QFileDialog,
@@ -17,6 +17,39 @@ class Mark:
     text: str = ''
     font_size: int = 24
     block: int = 12
+    points: list = field(default_factory=list)
+    opacity: int = 40
+
+
+TOOLS = [('펜', 'pen'), ('형광펜', 'marker'), ('사각형', 'rectangle'),
+         ('타원', 'ellipse'), ('화살표', 'arrow'), ('텍스트', 'text'), ('모자이크', 'mosaic')]
+
+
+def draw_marker(painter, mark, bounds):
+    points = mark.points or [mark.start]
+    area = QPolygonF(points).boundingRect().adjusted(-mark.width / 2 - 2, -mark.width / 2 - 2,
+                                                   mark.width / 2 + 2, mark.width / 2 + 2)
+    area = area.toAlignedRect().intersected(bounds)
+    if area.isEmpty():
+        return
+    # Paint one opaque mask per stroke so crossing the same stroke doesn't make seams darker.
+    layer = QImage(area.size(), QImage.Format.Format_ARGB32_Premultiplied)
+    layer.fill(Qt.GlobalColor.transparent)
+    stroke = QPainter(layer)
+    stroke.setRenderHint(QPainter.RenderHint.Antialiasing)
+    stroke.translate(-area.topLeft())
+    stroke.setPen(QPen(QColor(mark.color), mark.width, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+    if len(points) == 1 or all(point == points[0] for point in points):
+        stroke.drawPoint(points[0])
+    else:
+        stroke.drawPolyline(QPolygonF(points))
+    stroke.end()
+    painter.save()
+    painter.setOpacity(min(100, max(1, mark.opacity)) / 100)
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Multiply)
+    painter.drawImage(area.topLeft(), layer)
+    painter.restore()
 
 
 def render_marks(original, marks):
@@ -41,8 +74,17 @@ def render_marks(original, marks):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(QColor(mark.color), mark.width, Qt.PenStyle.SolidLine,
                             Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-        if mark.tool == 'rectangle':
+        if mark.tool == 'marker':
+            draw_marker(painter, mark, image.rect())
+        elif mark.tool == 'pen':
+            if len(mark.points) == 1:
+                painter.drawPoint(mark.points[0])
+            elif mark.points:
+                painter.drawPolyline(QPolygonF(mark.points))
+        elif mark.tool == 'rectangle':
             painter.drawRect(rect)
+        elif mark.tool == 'ellipse':
+            painter.drawEllipse(rect)
         elif mark.tool == 'arrow':
             painter.drawLine(mark.start, mark.end)
             angle = math.atan2(mark.end.y() - mark.start.y(), mark.end.x() - mark.start.x())
@@ -66,8 +108,10 @@ def render_marks(original, marks):
 class AnnotationCanvas(QWidget):
     changed = Signal()
 
-    def __init__(self, pixmap, parent=None):
+    def __init__(self, pixmap, parent=None, inline=False):
         super().__init__(parent)
+        self.inline = inline
+        self.stroke_points = []
         self.dpr = pixmap.devicePixelRatio()
         self.original = pixmap.toImage().copy()
         self.original.setDevicePixelRatio(1)
@@ -77,16 +121,21 @@ class AnnotationCanvas(QWidget):
         self.tool = 'rectangle'
         self.color = '#ef4444'
         self.width_px = 3
+        self.marker_width = 20
+        self.marker_color = '#facc15'
+        self.marker_opacity = 40
         self.font_size = 24
         self.block = 12
         self.start_point = None
         self.end_point = None
-        self.setMinimumSize(240, 160)
+        self.setMinimumSize(0, 0) if inline else self.setMinimumSize(240, 160)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setCursor(Qt.CursorShape.CrossCursor)
 
     def image_rect(self):
+        if self.inline:
+            return QRectF(self.rect())
         available = self.rect().adjusted(8, 8, -8, -8)
         size = self.original.size().scaled(available.size(), Qt.AspectRatioMode.KeepAspectRatio)
         return QRectF((self.width() - size.width()) / 2, (self.height() - size.height()) / 2,
@@ -100,8 +149,18 @@ class AnnotationCanvas(QWidget):
         y = (point.y() - rect.y()) * self.original.height() / rect.height()
         return QPointF(min(self.original.width() - 1, max(0, x)), min(self.original.height() - 1, max(0, y)))
 
+    def active_color(self):
+        return self.marker_color if self.tool == 'marker' else self.color
+
+    def set_active_color(self, color):
+        if self.tool == 'marker':
+            self.marker_color = color
+        else:
+            self.color = color
+
     def mark(self, start, end, text=''):
-        return Mark(self.tool, start, end, self.color, self.width_px, text, self.font_size, self.block)
+        width = self.marker_width if self.tool == 'marker' else self.width_px
+        return Mark(self.tool, start, end, self.active_color(), width, text, self.font_size, self.block, opacity=self.marker_opacity)
 
     def commit(self, mark):
         self.marks.append(mark)
@@ -112,6 +171,7 @@ class AnnotationCanvas(QWidget):
 
     def cancel_stroke(self):
         self.start_point = self.end_point = None
+        self.stroke_points = []
         self.update()
 
     def undo(self):
@@ -149,8 +209,20 @@ class AnnotationCanvas(QWidget):
             painter.translate(rect.topLeft())
             painter.scale(rect.width() / self.original.width(), rect.height() / self.original.height())
             painter.setPen(QPen(QColor(self.color), self.width_px, Qt.PenStyle.DashLine))
-            if self.tool == 'arrow':
+            if self.tool == 'marker':
+                mark = self.mark(self.start_point, self.end_point)
+                mark.points = list(self.stroke_points)
+                draw_marker(painter, mark, self.original.rect())
+            elif self.tool == 'pen':
+                painter.setPen(QPen(QColor(self.color), self.width_px, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                if len(self.stroke_points) == 1:
+                    painter.drawPoint(self.stroke_points[0])
+                else:
+                    painter.drawPolyline(QPolygonF(self.stroke_points))
+            elif self.tool == 'arrow':
                 painter.drawLine(self.start_point, self.end_point)
+            elif self.tool == 'ellipse':
+                painter.drawEllipse(QRectF(self.start_point, self.end_point).normalized())
             else:
                 painter.drawRect(QRectF(self.start_point, self.end_point).normalized())
             painter.restore()
@@ -170,17 +242,27 @@ class AnnotationCanvas(QWidget):
                 self.commit(self.mark(point, point, text))
             return
         self.start_point = self.end_point = point
+        self.stroke_points = [point]
         self.update()
 
     def mouseMoveEvent(self, event):
         if self.start_point is not None:
             self.end_point = self.image_point(event.position(), clamp=True)
+            if self.tool in ('pen', 'marker'):
+                self.stroke_points.append(self.end_point)
             self.update()
 
     def mouseReleaseEvent(self, event):
         if event.button() != Qt.MouseButton.LeftButton or self.start_point is None:
             return
         end = self.image_point(event.position(), clamp=True)
+        if self.tool in ('pen', 'marker'):
+            self.stroke_points.append(end)
+            mark = self.mark(self.start_point, end)
+            mark.points = list(self.stroke_points)
+            self.commit(mark)
+            self.cancel_stroke()
+            return
         rect = QRectF(self.start_point, end).normalized()
         valid = (math.hypot(rect.width(), rect.height()) >= 2 if self.tool == 'arrow'
                  else rect.width() >= 2 and rect.height() >= 2)
@@ -201,24 +283,40 @@ class AnnotationDialog(QDialog):
         layout = QVBoxLayout(self)
         toolbar = QHBoxLayout()
         self.tool = QComboBox()
-        for label, value in [('사각형', 'rectangle'), ('화살표', 'arrow'), ('텍스트', 'text'), ('모자이크', 'mosaic')]:
+        for label, value in TOOLS:
             self.tool.addItem(label, value)
         toolbar.addWidget(self.tool)
         self.canvas = AnnotationCanvas(pixmap)
+        self.canvas.tool = self.tool.currentData()
         self.tool.currentIndexChanged.connect(self.change_tool)
         color = QPushButton('색상')
         color.clicked.connect(self.choose_color)
         toolbar.addWidget(color)
+        self.option_widgets = {}
         for label, low, high, default, attribute in [('선', 1, 30, 3, 'width_px'),
                 ('글자', 8, 200, 24, 'font_size'), ('모자이크', 4, 100, 12, 'block')]:
-            toolbar.addWidget(QLabel(label))
+            option_label = QLabel(label)
+            toolbar.addWidget(option_label)
             spin = QSpinBox()
             spin.setRange(low, high)
             spin.setValue(default)
             spin.setSuffix(' px')
             spin.valueChanged.connect(lambda value, name=attribute: setattr(self.canvas, name, value))
             toolbar.addWidget(spin)
+            self.option_widgets[attribute] = (option_label, spin)
         layout.addLayout(toolbar)
+        marker_row = QHBoxLayout()
+        for label, low, high, default, attribute, suffix in [('형광펜 두께', 4, 100, 20, 'marker_width', ' px'), ('형광펜 진하기', 10, 80, 40, 'marker_opacity', ' %')]:
+            option_label = QLabel(label)
+            spin = QSpinBox()
+            spin.setRange(low, high)
+            spin.setValue(default)
+            spin.setSuffix(suffix)
+            spin.valueChanged.connect(lambda value, name=attribute: setattr(self.canvas, name, value))
+            marker_row.addWidget(option_label)
+            marker_row.addWidget(spin)
+            self.option_widgets[attribute] = (option_label, spin)
+        layout.addLayout(marker_row)
         layout.addWidget(self.canvas, 1)
         self.notice = QLabel('드래그하여 그리기 · 텍스트는 클릭하여 입력 · 우클릭으로 그리기 취소')
         layout.addWidget(self.notice)
@@ -240,21 +338,31 @@ class AnnotationDialog(QDialog):
             QShortcut(QKeySequence(key), self, activated=callback)
         self.canvas.changed.connect(self.update_actions)
         self.update_actions()
+        self.update_options()
         available = QApplication.primaryScreen().availableGeometry().size()
         self.setFixedSize(QSize(min(960, available.width() - 40), min(680, available.height() - 60)).expandedTo(self.minimumSizeHint()))
 
     def change_tool(self):
         self.canvas.cancel_stroke()
         self.canvas.tool = self.tool.currentData()
+        self.update_options()
+
+    def update_options(self):
+        active = {'pen': ['width_px'], 'rectangle': ['width_px'], 'ellipse': ['width_px'], 'arrow': ['width_px'], 'text': ['font_size'], 'mosaic': ['block'], 'marker': ['marker_width', 'marker_opacity']}
+        for attribute, widgets in self.option_widgets.items():
+            for widget in widgets:
+                widget.setEnabled(attribute in active[self.canvas.tool])
 
     def update_actions(self):
         self.undo_button.setEnabled(bool(self.canvas.marks))
         self.redo_button.setEnabled(bool(self.canvas.redo_marks))
 
     def choose_color(self):
-        color = QColorDialog.getColor(QColor(self.canvas.color), self, '주석 색상')
-        if color.isValid():
-            self.canvas.color = color.name()
+        from color_palette import PaletteDialog
+        dialog = PaletteDialog(self.canvas.active_color(), getattr(self.parent(), 'palette_store', None), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.canvas.set_active_color(dialog.color)
+        dialog.deleteLater()
 
     def copy_result(self):
         QApplication.clipboard().setPixmap(self.canvas.result())

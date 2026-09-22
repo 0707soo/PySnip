@@ -16,7 +16,7 @@ def save_session(path, pins):
             raise OSError('이미지를 저장하지 못했습니다.')
         records.append({'png': base64.b64encode(bytes(buffer.data())).decode('ascii'),
                         'x': pin.x(), 'y': pin.y(), 'scale': pin.scale,
-                        'dpr': pin.pixmap.devicePixelRatio(), 'locked': pin.locked})
+                        'dpr': pin.pixmap.devicePixelRatio(), 'locked': pin.locked, 'thumbnail': pin.thumbnail, 'text_card': pin.text_card})
     data = json.dumps({'version': 1, 'pins': records}).encode('utf-8')
     output = QSaveFile(str(path))
     if not output.open(QIODevice.WriteOnly):
@@ -43,5 +43,12 @@ def load_session(path):
         if not math.isfinite(scale) or not math.isfinite(dpr) or not 0.1 <= scale <= 5 or not 0 < dpr <= 16:
             raise ValueError('저장된 이미지 배율이 올바르지 않습니다.')
         pixmap.setDevicePixelRatio(dpr)
-        result.append((pixmap, int(item['x']), int(item['y']), scale, item.get('locked') is True))
+        text_card = None
+        if item.get('text_card') is not None:
+            from text_pin import normalize_card
+            try:
+                text_card = normalize_card(item['text_card'])
+            except (ValueError, TypeError):
+                pass  # A bad optional text field must not prevent restoring the image.
+        result.append((pixmap, int(item['x']), int(item['y']), scale, item.get('locked') is True, item.get('thumbnail') is True, text_card))
     return result

@@ -2,6 +2,8 @@ import os
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 import tempfile
 import unittest
+from unittest.mock import patch
+from PySide6.QtWidgets import QMessageBox
 from pathlib import Path
 from PySide6.QtCore import QPoint, QSettings
 from PySide6.QtGui import QPixmap
@@ -12,6 +14,12 @@ from pin_session import load_session
 
 
 class SessionTests(unittest.TestCase):
+    def setUp(self):
+        for method in ('exec', 'question'):
+            mock = patch('main.QMessageBox.' + method, return_value=QMessageBox.StandardButton.Yes)
+            mock.start()
+            self.addCleanup(mock.stop)
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])

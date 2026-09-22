@@ -5,7 +5,7 @@ import tempfile
 
 
 def run(report_path):
-    from PySide6.QtCore import QPoint, QSettings, QTimer
+    from PySide6.QtCore import QPoint, QPointF, QSettings, QTimer
     from PySide6.QtGui import QPixmap
     from PySide6.QtWidgets import QApplication
     from main import MainWindow
@@ -31,6 +31,26 @@ def run(report_path):
             assert int(reread.value('Appearance/opacity')) == 60
             assert int(reread.value('Appearance/border')) == 2
             assert all(pin.opacity_percent == 60 and pin.border_width == 2 for pin in window.pins)
+            from annotation_ui import Mark
+            from text_pin import normalize_card, render_card
+            from pin_session import save_session, load_session
+            from version import __version__
+            card = normalize_card({'text': 'PySnip release check / 한국어'})
+            text_pin = window.add_pin(render_card(card), QPoint(10, 10))
+            text_pin.text_card = card
+            text_pin.toggle_drawing()
+            text_pin.draw_canvas.commit(Mark('marker', QPointF(10, 20), QPointF(100, 20),
+                color='#ffff00', width=15, points=[QPointF(10, 20), QPointF(100, 20)]))
+            assert text_pin.draw_canvas.marks, 'Direct drawing failed'
+            text_pin.stop_drawing()
+            text_pin.toggle_thumbnail()
+            window.palette_store.toggle('#123456')
+            assert '#123456' in window.palette_store.favorites
+            save_session(window.session_path, window.pins)
+            loaded = load_session(window.session_path)
+            assert loaded[-1][5] and loaded[-1][6]['text'] == card['text']
+            window.open_editor(text_pin)
+            window.open_text_editor(text_pin)
             results = []
             job = OcrJob('Status')
             job.completed.connect(lambda result: (results.append(result), window.quit_app()))
@@ -44,7 +64,8 @@ def run(report_path):
             job.stop()
             assert code == 0 and results and results[0].get('ok'), f'OCR bridge failed: {results}'
             assert not window.pins, 'Pin windows remained after shutdown'
-            report.write_text(json.dumps({'ok': True, 'ocr': results[0], 'checks': ['icon', 'portable INI path and persistence', 'global settings', 'three pins shutdown', 'bundled OCR helper']}, ensure_ascii=False, indent=2), encoding='utf-8')
+            assert not window.editors, 'Editors remained after shutdown'
+            report.write_text(json.dumps({'ok': True, 'version': __version__, 'ocr': results[0], 'checks': ['icon', 'portable INI path and persistence', 'global settings', 'multiple pins and editors shutdown', 'bundled OCR helper', 'text card and thumbnail persistence', 'direct marker drawing', 'favorite colors']}, ensure_ascii=False, indent=2), encoding='utf-8')
         return 0
     except Exception as exc:
         report.write_text(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False), encoding='utf-8')

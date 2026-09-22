@@ -32,6 +32,10 @@ image.fill()
 for i in range(3):
     window.add_pin(image, QPoint(i * 50, 0))
 window.open_editor(window.pins[0])
+window.pins[1].toggle_drawing()
+app.clipboard().setText('shutdown text card')
+window.pin_clipboard()
+window.open_text_editor(window.pins[-1])
 button = next(b for b in window.findChildren(QPushButton) if b.text() == '종료')
 QTimer.singleShot(0, button.click)
 # A quit rejected by closeEvent must fail, rather than hang the test runner.

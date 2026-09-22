@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 DEFAULTS = {'capture': 'F1', 'clipboard': 'F3', 'toggle': 'F2'}
-LABELS = {'capture': '영역 캡처', 'clipboard': '클립보드 이미지 고정', 'toggle': '고정 이미지 숨김·복원'}
+LABELS = {'capture': '영역 캡처', 'clipboard': '클립보드 이미지·텍스트 고정', 'toggle': '고정 이미지 숨김·복원'}
 KEYS = {f'F{i}': 0x6F + i for i in range(1, 25) if i != 12}
 KEYS.update({chr(i): i for i in range(ord('A'), ord('Z') + 1)})
 KEYS.update({str(i): ord(str(i)) for i in range(10)})
@@ -42,8 +42,8 @@ def validate_bindings(bindings, check_reserved=True):
                 reason = 'Win 키 조합은 Windows 예약 단축키이므로 사용할 수 없습니다.'
             elif modifiers == MODIFIERS['Alt'] and key == KEYS['F4']:
                 reason = 'Alt+F4는 창 닫기 단축키이므로 사용할 수 없습니다.'
-            elif modifiers == MODIFIERS['Ctrl'] and key in (KEYS['C'], KEYS['S'], KEYS['T'], KEYS['E'], KEYS['L']):
-                reason = 'Ctrl+C/S/T/E/L은 앱의 복사·저장·OCR·편집·잠금 기능에서 사용하는 단축키입니다.'
+            elif modifiers == MODIFIERS['Ctrl'] and key in (KEYS['C'], KEYS['S'], KEYS['T'], KEYS['E'], KEYS['L'], KEYS['Z'], KEYS['Y']):
+                reason = 'Ctrl+C/S/T/E/L/Z/Y는 앱의 복사·저장·OCR·편집·잠금·실행 취소 기능에서 사용하는 단축키입니다.'
             if reason:
                 raise ValueError(f'{LABELS[name]}: {reason}')
     if len(set(specs)) != len(specs):

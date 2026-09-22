@@ -44,6 +44,7 @@ def main():
     with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED, compresslevel=9) as bundle:
         bundle.write(ROOT / 'dist' / 'PySnip.exe', 'PySnip/PySnip.exe')
         bundle.write(ROOT / 'README.md', 'PySnip/README.md')
+        bundle.write(ROOT / 'CHANGELOG.md', 'PySnip/CHANGELOG.md')
     print(f'Release: {archive} ({archive.stat().st_size / 1024**2:.1f} MiB)')
 
 

@@ -105,28 +105,44 @@ class PinWindow(QWidget):
     settings_requested = Signal()
     opacity_requested = Signal(int)
     edit_requested = Signal(object)
+    text_edit_requested = Signal(object)
 
     def __init__(self, pixmap, position):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
         self.pixmap = pixmap
+        self.text_card = None
         self.scale = 1.0
         self.locked = False
+        self.thumbnail = False
+        self.drawing = False
+        self.draw_canvas = None
+        self.draw_panel = None
+        self.palette_store = None
+        self.skip_close_confirmation = False
+        self.close_prompt = None
         self.border_width = 1
         self.opacity_percent = 100
         self.drag_offset = None
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setWindowTitle('PySnip — 고정 이미지')
+        self.setToolTip('Shift+더블클릭: 썸네일 접기·펼치기')
         self.setMinimumSize(1, 1)
         self.move(position)
         self.resize_image()
-        for sequence, callback in [('Ctrl+C', self.copy_image), ('Ctrl+S', self.save_image), ('Ctrl+T', self.extract_text), ('Escape', self.close), ('0', self.reset_size), ('Ctrl+L', self.toggle_lock), ('Ctrl+E', lambda: self.edit_requested.emit(self))]:
+        for sequence, callback in [('Ctrl+C', self.copy_image), ('Ctrl+S', self.save_image), ('Ctrl+T', self.extract_text), ('Escape', self.handle_escape), ('Space', self.toggle_drawing), ('Ctrl+Z', self.undo_drawing), ('Ctrl+Y', self.redo_drawing), ('0', self.reset_size), ('Ctrl+L', self.toggle_lock), ('Ctrl+E', lambda: self.edit_requested.emit(self))]:
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.activated.connect(callback)
 
     def resize_image(self):
         size = self.pixmap.deviceIndependentSize()
-        self.resize(max(1, round(size.width() * self.scale)) + 2 * self.border_width,
-                    max(1, round(size.height() * self.scale)) + 2 * self.border_width)
+        width = max(1, round(size.width() * self.scale))
+        height = max(1, round(size.height() * self.scale))
+        if self.thumbnail:
+            factor = min(1.0, 160 / width, 160 / height)
+            width, height = max(1, round(width * factor)), max(1, round(height * factor))
+        self.resize(width + 2 * self.border_width, height + 2 * self.border_width)
+        if self.draw_canvas is not None:
+            self.draw_canvas.setGeometry(self.rect().adjusted(self.border_width, self.border_width, -self.border_width, -self.border_width))
 
     def set_opacity_percent(self, value):
         self.opacity_percent = min(100, max(20, int(value)))
@@ -153,31 +169,119 @@ class PinWindow(QWidget):
         if not self.locked and self.drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
             self.move(event.globalPosition().toPoint() - self.drag_offset)
 
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            self.toggle_thumbnail()
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+
+    def toggle_thumbnail(self):
+        self.stop_drawing()
+        if self.locked:
+            return
+        self.thumbnail = not self.thumbnail
+        self.drag_offset = None
+        self.resize_image()
+        self.update()
+
     def mouseReleaseEvent(self, event):
         self.drag_offset = None
 
     def wheelEvent(self, event):
-        if self.locked:
+        if self.locked or self.drawing:
             return
         delta = event.angleDelta().y()
         if not delta:
             return
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.opacity_requested.emit(self.opacity_percent + (5 if delta > 0 else -5))
-        else:
+        elif not self.thumbnail:
             self.scale = min(5.0, max(0.1, self.scale * (1.1 if delta > 0 else 1 / 1.1)))
             self.resize_image()
 
     def toggle_lock(self):
+        self.stop_drawing()
         self.locked = not self.locked
         self.drag_offset = None
         self.setWindowTitle('PySnip — 고정 이미지' + (' (잠금)' if self.locked else ''))
 
     def reset_size(self):
+        self.stop_drawing()
         if self.locked:
             return
+        self.thumbnail = False
         self.scale = 1.0
         self.resize_image()
+
+    def toggle_drawing(self):
+        if self.drawing:
+            self.stop_drawing()
+            return
+        if self.locked or self.close_prompt is not None:
+            return
+        if self.thumbnail:
+            self.toggle_thumbnail()
+        if self.draw_canvas is None:
+            from annotation_ui import AnnotationCanvas
+            from drawing_panel import DrawingPanel
+            self.draw_canvas = AnnotationCanvas(self.pixmap, self, inline=True)
+            self.draw_canvas.tool = 'pen'
+            self.draw_canvas.changed.connect(self.update_drawing)
+            self.draw_panel = DrawingPanel(self)
+        self.drawing = True
+        self.resize_image()
+        self.draw_canvas.show()
+        self.draw_canvas.raise_()
+        self.draw_panel.show_near_pin()
+        self.activateWindow()
+        self.draw_canvas.setFocus()
+
+    def update_drawing(self):
+        self.pixmap = self.draw_canvas.result()
+        self.update()
+
+    def stop_drawing(self):
+        self.drawing = False
+        if self.draw_canvas is not None:
+            self.draw_canvas.cancel_stroke()
+            self.draw_canvas.hide()
+        if self.draw_panel is not None:
+            self.draw_panel.hide()
+
+    def undo_drawing(self):
+        if self.drawing:
+            self.draw_canvas.undo()
+
+    def redo_drawing(self):
+        if self.drawing:
+            self.draw_canvas.redo()
+
+    def handle_escape(self):
+        if self.drawing:
+            self.stop_drawing()
+        else:
+            self.close()
+
+    def hideEvent(self, event):
+        self.stop_drawing()
+        super().hideEvent(event)
+
+    def replace_text_card(self, card, pixmap):
+        self.stop_drawing()
+        if self.draw_canvas is not None:
+            self.draw_canvas.changed.disconnect(self.update_drawing)
+            self.draw_panel.deleteLater()
+            self.draw_canvas.deleteLater()
+            self.draw_panel = self.draw_canvas = None
+        self.text_card = dict(card)
+        self.pixmap = pixmap
+        self.resize_image()
+        self.update()
+
+    def copy_source_text(self):
+        if self.text_card is not None:
+            QApplication.clipboard().setText(self.text_card['text'])
 
     def copy_image(self):
         QApplication.clipboard().setPixmap(self.pixmap)
@@ -195,16 +299,50 @@ class PinWindow(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        if self.text_card is not None:
+            menu.addAction('원문 텍스트 복사', self.copy_source_text)
+            menu.addAction('텍스트 카드 편집', lambda: self.text_edit_requested.emit(self))
+            menu.addSeparator()
         lock = menu.addAction('이동·크기 잠금 (Ctrl+L)', self.toggle_lock)
         lock.setCheckable(True)
         lock.setChecked(self.locked)
+        thumbnail = menu.addAction('썸네일로 접기 (Shift+더블클릭)' if not self.thumbnail else '이미지 펼치기 (Shift+더블클릭)', self.toggle_thumbnail)
+        thumbnail.setEnabled(not self.locked)
+        drawing = menu.addAction('그리기 완료 (Space)' if self.drawing else '이미지 위에 그리기 (Space)', self.toggle_drawing)
+        drawing.setEnabled(not self.locked)
         menu.addAction('이미지 편집 (Ctrl+E)', lambda: self.edit_requested.emit(self))
         menu.addSeparator()
         for label, callback in [('복사 (Ctrl+C)', self.copy_image), ('저장 (Ctrl+S)', self.save_image), ('텍스트 추출 OCR (Ctrl+T)', self.extract_text), ('설정', self.settings_requested.emit), ('원래 크기 (0)', self.reset_size), ('닫기 (Esc)', self.close)]:
             menu.addAction(label, callback)
         menu.exec(event.globalPos())
 
+    def close_without_confirmation(self):
+        self.skip_close_confirmation = True
+        if self.close_prompt is not None:
+            self.close_prompt.reject()
+            return  # The original closeEvent resumes and completes the close.
+        self.close()
+
     def closeEvent(self, event):
+        if not self.skip_close_confirmation:
+            if self.close_prompt is not None:
+                event.ignore()
+                return
+            prompt = QMessageBox(QMessageBox.Icon.Question, '이미지 닫기',
+                                 '이 고정 이미지를 닫으시겠습니까?',
+                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
+            prompt.button(QMessageBox.StandardButton.Yes).setText('닫기')
+            prompt.button(QMessageBox.StandardButton.No).setText('취소')
+            prompt.setDefaultButton(QMessageBox.StandardButton.No)
+            prompt.setEscapeButton(QMessageBox.StandardButton.No)
+            self.close_prompt = prompt
+            result = prompt.exec()
+            self.close_prompt = None
+            prompt.deleteLater()
+            if not self.skip_close_confirmation and result != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+        self.stop_drawing()
         self.closed.emit(self)
         super().closeEvent(event)
 
@@ -213,6 +351,8 @@ class MainWindow(QMainWindow):
     def __init__(self, enable_integrations=True, settings=None):
         super().__init__()
         self.settings = settings if settings is not None else open_portable_settings()
+        from color_palette import PaletteStore
+        self.palette_store = PaletteStore(self.settings, self)
         self.opacity_percent, self.border_width = 100, 1
         self.ocr_language = self.settings.value('OCR/language', 'ko-KR')
         if self.ocr_language not in ('ko-KR', 'en-US'):
@@ -272,7 +412,7 @@ class MainWindow(QMainWindow):
         title.setStyleSheet('font-size: 28px; font-weight: 700;')
         layout.addWidget(title)
         layout.addWidget(QLabel('화면을 캡처하고, 필요한 곳에 고정하세요.'))
-        for label, callback in [('영역 캡처', self.capture), ('클립보드 이미지 고정', self.pin_clipboard), ('설정', self.open_settings), ('고정 이미지 모두 닫기', self.close_pins), ('종료', self.quit_app)]:
+        for label, callback in [('영역 캡처', self.capture), ('클립보드 고정 (이미지·텍스트)', self.pin_clipboard), ('설정', self.open_settings), ('고정 이미지 모두 닫기', self.close_pins), ('종료', self.quit_app)]:
             button = QPushButton(label)
             button.setMinimumHeight(34)
             button.clicked.connect(callback)
@@ -319,7 +459,7 @@ class MainWindow(QMainWindow):
         # Reserve space for the longest supported shortcut before fixing the size.
         if self.settings.status() != QSettings.Status.NoError:
             self.status.setText('PySnip.ini를 읽거나 만들지 못했습니다. 앱 폴더의 쓰기 권한과 INI 형식을 확인하세요.')
-        longest_label = '클립보드 이미지 고정  ·  Ctrl+Alt+Shift+Num9'
+        longest_label = '클립보드 고정 (이미지·텍스트)  ·  Ctrl+Alt+Shift+Num9'
         text_width = self.action_buttons[1].fontMetrics().horizontalAdvance(longest_label)
         self.setFixedSize(QSize(max(560, text_width + 80), 420).expandedTo(self.sizeHint()))
 
@@ -341,9 +481,11 @@ class MainWindow(QMainWindow):
         except (OSError, ValueError, KeyError, TypeError) as exc:
             self.status.setText(f'고정 이미지 복원 실패: {exc}')
             return
-        for pixmap, x, y, scale, locked in records:
+        for pixmap, x, y, scale, locked, thumbnail, text_card in records:
             pin = self.add_pin(pixmap, QPoint(x, y))
+            pin.text_card = text_card
             pin.scale = scale
+            pin.thumbnail = thumbnail
             if locked:
                 pin.toggle_lock()
             pin.resize_image()
@@ -376,7 +518,7 @@ class MainWindow(QMainWindow):
         dialog.show()
 
     def refresh_hotkey_labels(self):
-        labels = [f"영역 캡처  ·  {self.bindings['capture']}", f"클립보드 이미지 고정  ·  {self.bindings['clipboard']}"]
+        labels = [f"영역 캡처  ·  {self.bindings['capture']}", f"클립보드 고정 (이미지·텍스트)  ·  {self.bindings['clipboard']}"]
         for button, label in zip(self.action_buttons, labels):
             button.setText(label)
         for action, label in zip(self.tray_actions, labels):
@@ -525,11 +667,13 @@ class MainWindow(QMainWindow):
         if self.quitting:
             return None
         pin = PinWindow(pixmap, position)
+        pin.palette_store = self.palette_store
         pin.set_opacity_percent(self.opacity_percent)
         pin.set_border_width(self.border_width)
         self.pins.append(pin)
         pin.closed.connect(self.remove_pin)
         pin.edit_requested.connect(self.open_editor)
+        pin.text_edit_requested.connect(self.open_text_editor)
         pin.ocr_requested.connect(self.open_ocr)
         pin.settings_requested.connect(self.open_settings)
         pin.opacity_requested.connect(self.set_global_opacity)
@@ -542,7 +686,7 @@ class MainWindow(QMainWindow):
     def remove_pin(self, pin):
         if pin in self.pins:
             if not self.quitting:
-                self.closed_pins.append((QPixmap(pin.pixmap), QPoint(pin.pos()), pin.scale, pin.locked))
+                self.closed_pins.append((QPixmap(pin.pixmap), QPoint(pin.pos()), pin.scale, pin.locked, pin.thumbnail, dict(pin.text_card) if pin.text_card else None))
                 self.trim_history()
             self.pins.remove(pin)
         if not self.pins:
@@ -565,17 +709,48 @@ class MainWindow(QMainWindow):
     def restore_closed_pin(self):
         if self.quitting or self.capturing or not self.closed_pins:
             return
-        pixmap, position, scale, locked = self.closed_pins.pop()
+        pixmap, position, scale, locked, thumbnail, text_card = self.closed_pins.pop()
         if self.pins_hidden:
             self.toggle_pins()
         pin = self.add_pin(pixmap, position)
+        pin.text_card = text_card
         pin.scale = scale
+        pin.thumbnail = thumbnail
         if locked:
             pin.toggle_lock()
         pin.resize_image()
         if not any(screen.availableGeometry().contains(pin.pos()) for screen in QApplication.screens()):
             pin.move(QApplication.primaryScreen().availableGeometry().topLeft() + QPoint(30, 30))
         self.refresh_history()
+
+    def open_text_editor(self, pin):
+        if self.quitting or self.capturing or pin.text_card is None:
+            return
+        for editor in self.editors:
+            if getattr(editor, 'target_pin', None) is pin:
+                editor.showNormal()
+                editor.raise_()
+                editor.activateWindow()
+                return
+        from text_pin import TextCardDialog
+        def apply(card, pixmap):
+            if self.quitting or pin not in self.pins:
+                return False
+            if card == pin.text_card:
+                return True
+            if pin.draw_canvas is not None and pin.draw_canvas.marks:
+                if QMessageBox.question(self, '텍스트 카드 수정',
+                        '텍스트를 수정하면 이 카드에 그린 주석이 사라집니다. 수정하시겠습니까?',
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
+                    return False
+            pin.replace_text_card(card, pixmap)
+            return True
+        dialog = TextCardDialog(pin, apply, self)
+        self.editors.append(dialog)
+        pin.closed.connect(dialog.reject)
+        dialog.finished.connect(lambda _result: self.editors.remove(dialog) if dialog in self.editors else None)
+        dialog.show()
 
     def open_editor(self, pin):
         if self.quitting or self.capturing:
@@ -596,11 +771,30 @@ class MainWindow(QMainWindow):
     def pin_clipboard(self):
         if self.capturing or self.quitting or self.settings_dialog is not None:
             return
-        pixmap = QApplication.clipboard().pixmap()
+        clipboard = QApplication.clipboard()
+        pixmap = clipboard.pixmap()
+        text_card = None
         if pixmap.isNull():
-            QMessageBox.information(self, '클립보드', '클립보드에 이미지가 없습니다.')
-            return
-        self.add_pin(pixmap, QCursor.pos())
+            text = clipboard.text()
+            if not text.strip():
+                QMessageBox.information(self, '클립보드', '클립보드에 이미지나 텍스트가 없습니다.')
+                return
+            from text_pin import normalize_card, render_card
+            try:
+                text_card = normalize_card({'text': text})
+                pixmap = render_card(text_card)
+            except ValueError as exc:
+                QMessageBox.warning(self, '텍스트 고정', str(exc))
+                return
+        pin = self.add_pin(pixmap, QCursor.pos())
+        pin.text_card = text_card
+        if text_card:
+            bounds = (QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()).availableGeometry()
+            pin.scale = min(1.0, max(0.1, (bounds.width() - 40) / pixmap.deviceIndependentSize().width()),
+                            max(0.1, (bounds.height() - 40) / pixmap.deviceIndependentSize().height()))
+            pin.resize_image()
+            pin.move(max(bounds.left(), min(pin.x(), bounds.right() - pin.width() + 1)),
+                     max(bounds.top(), min(pin.y(), bounds.bottom() - pin.height() + 1)))
 
     def refresh_toggle_label(self):
         text = f"고정 이미지 모두 {'복원' if self.pins_hidden else '숨기기'}  ·  {self.bindings['toggle']}"
@@ -627,8 +821,17 @@ class MainWindow(QMainWindow):
             self.settings_dialog.activateWindow()
 
     def close_pins(self):
+        if not self.pins:
+            return
+        if not self.quitting:
+            result = QMessageBox.question(self, '고정 이미지 모두 닫기',
+                f'고정 이미지 {len(self.pins)}개를 모두 닫으시겠습니까?',
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if result != QMessageBox.StandardButton.Yes:
+                return
         for pin in list(self.pins):
-            pin.close()
+            pin.close_without_confirmation()
 
     def cleanup(self):
         if self.quitting:

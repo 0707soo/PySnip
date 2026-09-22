@@ -4,6 +4,8 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from PySide6.QtWidgets import QMessageBox
+from unittest.mock import patch
 from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
 from PySide6.QtGui import QColor, QImage, QPixmap, QWheelEvent
 from PySide6.QtTest import QTest
@@ -16,6 +18,12 @@ from pin_session import save_session, load_session
 
 
 class EditingTests(unittest.TestCase):
+    def setUp(self):
+        for method in ('exec', 'question'):
+            mock = patch('main.QMessageBox.' + method, return_value=QMessageBox.StandardButton.Yes)
+            mock.start()
+            self.addCleanup(mock.stop)
+
     @classmethod
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
@@ -87,7 +95,7 @@ class EditingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'session.json'
             save_session(path, [pin])
-            self.assertTrue(load_session(path)[0][-1])
+            self.assertTrue(load_session(path)[0][4])
         pin.toggle_lock()
         pin.wheelEvent(event)
         self.assertGreater(pin.scale, 2)
